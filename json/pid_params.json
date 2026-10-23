@@ -1,0 +1,15 @@
+{
+  "hfov": 89.5,
+  "omega_pan": 3.9,
+  "omega_tilt": 3.9,
+  "kd_pan": 0.0,
+  "kd_tilt": 0.0,
+  "deadzone": 20.0,
+  "max_vel": 60.0,
+  "acq_vel": 20.0,
+  "acq_ramp": 350.0,
+  "max_accel": 700.0,
+  "err_alpha": 0.6,
+  "d_alpha": 0.2,
+  "hold_ms": 70.0
+}

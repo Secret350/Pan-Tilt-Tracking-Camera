@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Project
+dataset/
+models/
+
+# Test file
+infer_test/
+
+# Train process
+train/runs/
+train/weights
+
+# Model
+*.pt
+*.onnx
+*.engine
+
+# Others
+video/
+ndung_bcao/
+
+# IDE
+.vscode/
+.idea/
