@@ -13,6 +13,13 @@ GIAO THỨC SERIAL
   PC -> ESP32 : E,<err_x>,<err_y>,<has_target>\n   |  P,<tên>,<giá trị>\n  |  H,<pan>,<tilt>\n
   ESP32 -> PC : D,<khoảng_cách_mm>,<valid>\n        |  T,ERR\n (không tìm thấy VL53L0X)
 
+YÊU CẦU OPENCV
+  OpenCV >= 5 (xem CV_MIN_MAJOR). Cài (opencv 5 cần numpy >= 2):
+      pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless
+      pip install opencv-python==5.0.0.93 opencv-contrib-python==5.0.0.93
+  Lý do cài cả hai CÙNG phiên bản: ultralytics đòi opencv-python, mediapipe đòi opencv-contrib-python.
+  Kiểm tra bản thực sự được nạp: log "[CV] OpenCV ..." khi chương trình khởi động.
+
 LOGIC ZOOM THEO KHOẢNG CÁCH
   - Cảm biến gắn cùng khung camera nên đo vật ở TÂM khung hình. Vì vậy chỉ tin số đo khi mục tiêu
     đang gần tâm (|err_x|, |err_y| < DIST_GATE_ERR_PX).
@@ -21,6 +28,7 @@ LOGIC ZOOM THEO KHOẢNG CÁCH
     (chia cho hệ số zoom) nên các tham số PID/hfov giữ nguyên ý nghĩa.
   - Box mục tiêu biến mất quá ZOOM_LOST_GRACE_SEC -> trả về x1.0 như ban đầu.
 """
+import contextlib
 import csv
 import json
 import os
@@ -42,6 +50,9 @@ try:  # tùy chọn: thiếu mediapipe thì chương trình vẫn chạy, chỉ 
     import mediapipe as mp
 except ImportError:
     mp = None
+
+# --- OpenCV ---
+CV_MIN_MAJOR = 5  # thấp hơn vẫn chạy được nhưng sẽ in cảnh báo lúc khởi động
 
 # ---Distance (VL53L0X sensor)---
 DIST_MEDIAN_N = 30  # lọc median 5 mẫu gần nhất (khử nhiễu xung)
@@ -148,6 +159,19 @@ LOCK_LOST_GRACE_SEC = 0.5  # ID bị khóa mất bao lâu thì nhả khóa (0 = 
 # Ghi chú: SHOW_WINDOW, WINDOW_NAME, QUIT_KEY, TUNING_GUI, TUNING_WINDOW, SAVE_KEY, TARGET_SELECT, MAX_DET, USE_HALF
 # là hằng số của bản cũ (cửa sổ OpenCV + trackbar). Giá trị giữ nguyên nhưng hiện không còn được dùng vì
 # giao diện đã chuyển sang gui.py và việc chọn mục tiêu do tracker ID đảm nhiệm.
+
+def log_cv_version():
+    """In phiên bản + vị trí cv2 ĐANG ĐƯỢC NẠP. Vì ultralytics/mediapipe kéo thêm gói opencv riêng,
+    rất dễ tưởng đã lên 5 trong khi Python vẫn nạp bản cũ."""
+    try:
+        major = int(cv2.__version__.split(".")[0])
+    except ValueError:
+        major = 0
+    print(f"[CV] OpenCV {cv2.__version__}  ({os.path.dirname(os.path.abspath(cv2.__file__))})")
+    if major < CV_MIN_MAJOR:
+        print(f"[CV] CẢNH BÁO: cần OpenCV >= {CV_MIN_MAJOR}, đang nạp {cv2.__version__}. "
+              f"Gỡ hết gói opencv-* rồi cài lại (xem đầu file).")
+
 
 _ser = None
 _ser_lock = threading.Lock()  # ghi serial từ nhiều luồng (engine + GUI)
@@ -485,7 +509,7 @@ class CameraStream:
             cap.release()
             return None
 
-        fcc = cv2.VideoWriter_fourcc(*fourcc_str) if fourcc_str else None
+        fcc = cv2.VideoWriter.fourcc(*fourcc_str) if fourcc_str else None
         if fcc is not None and CAP_FOURCC_FIRST:
             cap.set(cv2.CAP_PROP_FOURCC, fcc)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
@@ -552,6 +576,36 @@ class CameraStream:
 
 
 # ======================= MASK KHUÔN MẶT =======================
+def _is_ascii(p):
+    try:
+        p.encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+@contextlib.contextmanager
+def _ascii_cwd():
+    """MediaPipe (C++) trên Windows abort cả tiến trình nếu thư mục làm việc có ký tự không phải ASCII
+    (vd 'Đồ án môn'). Tạm chuyển sang thư mục gốc của ổ đĩa trong lúc khởi tạo rồi trả lại."""
+    old = os.getcwd()
+    root = (os.path.splitdrive(sys.executable)[0] or "") + os.sep
+    try:
+        os.chdir(root)
+        yield
+    finally:
+        os.chdir(old)
+
+
+def _check_mediapipe_paths():
+    """Các đường dẫn KHÔNG thể né bằng chdir: nếu có ký tự lạ thì bỏ mask còn hơn để MediaPipe abort chương trình."""
+    bad = [(n, p) for n, p in (("python", sys.executable), ("mediapipe", os.path.dirname(mp.__file__)))
+           if not _is_ascii(p)]
+    if bad:
+        raise RuntimeError("đường dẫn có ký tự không phải ASCII (" + "; ".join(f"{n}: {p}" for n, p in bad) +
+                           ") -> MediaPipe sẽ crash. Cài lại Python/venv vào đường dẫn chỉ gồm chữ không dấu")
+
+
 class FaceMasker:
     """YOLO bbox -> crop -> MediaPipe Face Mesh (468 landmark) -> convex hull.
 
@@ -564,24 +618,29 @@ class FaceMasker:
     def __init__(self):
         if mp is None:
             raise RuntimeError("chưa cài mediapipe (pip install mediapipe)")
+        _check_mediapipe_paths()
         self._lm = None
         self._legacy = False
         if hasattr(mp, "solutions"):  # mediapipe cũ
             self._legacy = True
-            self._lm = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True, max_num_faces=1, refine_landmarks=False,
-                min_detection_confidence=0.5)
+            with _ascii_cwd():
+                self._lm = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=True, max_num_faces=1, refine_landmarks=False,
+                    min_detection_confidence=0.5)
         else:  # mediapipe mới: Tasks API, cần file .task
             if not os.path.isfile(FACE_LANDMARKER_MODEL):
                 if not FACE_LANDMARKER_AUTODOWNLOAD:
                     raise RuntimeError(f"thiếu {FACE_LANDMARKER_MODEL} (mediapipe mới cần face_landmarker.task)")
                 self._download_model()
             from mediapipe.tasks.python import BaseOptions, vision
+            with open(FACE_LANDMARKER_MODEL, "rb") as f:  # Python đọc được đường dẫn Unicode; C++ thì không
+                model_bytes = f.read()
             opts = vision.FaceLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL),
+                base_options=BaseOptions(model_asset_buffer=model_bytes),
                 running_mode=vision.RunningMode.IMAGE, num_faces=1,
                 min_face_detection_confidence=0.5, min_face_presence_confidence=0.5)
-            self._lm = vision.FaceLandmarker.create_from_options(opts)
+            with _ascii_cwd():
+                self._lm = vision.FaceLandmarker.create_from_options(opts)
         self._state = {}  # tid -> {"pts": (468,2) float32 theo bbox, "ok": frame_idx lần thành công cuối}
         self._tried = {}  # tid -> frame_idx lần thử cuối (để cách quãng EVERY_N cả khi thất bại)
         self._fi = 0
@@ -787,6 +846,7 @@ class TrackingEngine(threading.Thread):
     def run(self):
         global _ser
         cam = None
+        log_cv_version()
         try:
             device = DEVICE or ("cuda:0" if torch.cuda.is_available() else "cpu")
             self.status = f"đang nạp model ({device})..."
