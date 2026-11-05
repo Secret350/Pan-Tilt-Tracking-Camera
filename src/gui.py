@@ -249,7 +249,7 @@ class App(tk.Tk):
         grid.pack(fill="x", padx=14, pady=10)
         self.sv, self.sl = {}, {}
         rows = [("mode", "●"), ("error", "⎿"), ("speed", "⎿"), ("sensor", "⎿"), ("zoom", "⎿"),
-                ("serial", "⎿"), ("model", "⎿")]
+                ("serial", "⎿"), ("mask", "⎿"), ("model", "⎿")]
         for i, (key, glyph) in enumerate(rows):
             tk.Label(grid, text=glyph, fg=ACCENT if i == 0 else MUTED, bg=CARD,
                      font=self.f(13)).grid(row=i, column=0, sticky="w")
@@ -461,6 +461,9 @@ class App(tk.Tk):
             self.sl["zoom"].config(fg=TEXT)
         self.sv["serial"].set(self.engine.serial_text)
         self.sl["serial"].config(fg=RED if "KHÔNG" in self.engine.serial_text else TEXT)
+        mt = self.engine.mask_text
+        self.sv["mask"].set(mt if len(mt) <= 60 else mt[:57] + "...")
+        self.sl["mask"].config(fg=RED if mt.startswith("TẮT") else (AMBER if mt.startswith("không") else TEXT))
 
     def _on_close(self):
         try:

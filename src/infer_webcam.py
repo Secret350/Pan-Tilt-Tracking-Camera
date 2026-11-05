@@ -38,13 +38,18 @@ import torch
 from ultralytics import YOLO
 import serial
 
+try:  # tùy chọn: thiếu mediapipe thì chương trình vẫn chạy, chỉ không có mask khuôn mặt
+    import mediapipe as mp
+except ImportError:
+    mp = None
+
 # ---Distance (VL53L0X sensor)---
-DIST_MEDIAN_N = 5  # lọc median 5 mẫu gần nhất (khử nhiễu xung)
+DIST_MEDIAN_N = 30  # lọc median 5 mẫu gần nhất (khử nhiễu xung)
 DIST_MAX_AGE_S = 0.4  # thời gian đợi trước khi coi như mất dữ liệu từ sensor
 DIST_GATE_ERR_PX = 80  # chỉ tin khoảng cách khi |errx|,|erry| nhỏ hơn mức này
 
 # --- Camera ---
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 CAP_BACKEND = "MSMF"  # đã probe: MSMF cho ~28.9 fps ở 1280x720 (backend tốt nhất trên thiết bị)
 CAP_FOURCC_FIRST = False  # MSMF bỏ qua FOURCC nên FALSE/TRUE đều cho 28.9 fps;
 # giữ False để nếu phải rơi về DSHOW thì vẫn đặt MJPG đúng thứ tự
@@ -109,6 +114,25 @@ ZOOM_DIST_THRESHOLD_MM = 800  # khoảng cách > ngưỡng này thì zoom. Phả
 ZOOM_RELEASE_HYST_MM = 100  # đang zoom: chỉ thôi zoom khi đo được khoảng cách < ngưỡng - 100 mm (chống nháy)
 ZOOM_FAR_AS_EXCEED = True  # cảm biến báo "ngoài tầm đo" (xa hơn ~1.2 m) cũng tính là vượt ngưỡng
 ZOOM_LOST_GRACE_SEC = 0.3  # box biến mất bao lâu thì trả về x1.0 (0 = trả về ngay lập tức)
+
+# --- Mask khuôn mặt bám theo đường viền (MediaPipe landmark -> convex hull) ---
+FACE_MASK_ENABLE = True
+FACE_MASK_DRAW = True  # True: vẽ mask thẳng lên frame trong snapshot (gui.py không cần sửa)
+FACE_MASK_ONLY_TARGET = True  # True: chỉ làm mask cho mục tiêu đang bám (nhanh); False: mọi track (tối đa MAX_DET_GUI)
+FACE_MASK_EVERY_N = 2  # chạy landmark mỗi N frame; frame giữa dùng lại landmark, chiếu lại lên bbox hiện tại
+FACE_MASK_HOLD_FRAMES = 10  # landmark thất bại (mặt quay đi...) vẫn giữ mask cũ tối đa chừng này frame
+FACE_MASK_SMOOTH = 0.5  # EMA cho landmark, 1.0 = không lọc, nhỏ hơn = mượt hơn nhưng trễ hơn
+FACE_MASK_PAD = 0.10  # nới bbox khi cắt crop đưa vào MediaPipe để landmark không bị cắt ở rìa
+FACE_MASK_MIN_PX = 40  # bbox nhỏ hơn mức này (px) thì bỏ qua
+FACE_MASK_COLOR = (0, 255, 0)  # BGR, mục tiêu đang bám
+FACE_MASK_COLOR_OTHER = (255, 200, 0)  # BGR, các track còn lại
+FACE_MASK_ALPHA = 0.35
+FACE_MASK_OUTLINE_PX = 2
+# Chỉ cần khi mediapipe KHÔNG còn mp.solutions (bản mới): tải face_landmarker.task từ trang MediaPipe Face Landmarker
+FACE_LANDMARKER_MODEL = "../models/face_landmarker.task"
+FACE_LANDMARKER_AUTODOWNLOAD = True  # file thiếu thì tự tải (~4 MB) về FACE_LANDMARKER_MODEL ở lần chạy đầu
+FACE_LANDMARKER_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+                       "face_landmarker/float16/1/face_landmarker.task")
 
 # --- Chọn / khóa mục tiêu (chuyển từ gui.py sang core, giá trị giữ nguyên) ---
 TRACKER_CFG = "bytetrack.yaml"  # hoặc "botsort.yaml"
@@ -527,6 +551,153 @@ class CameraStream:
         self.cap.release()
 
 
+# ======================= MASK KHUÔN MẶT =======================
+class FaceMasker:
+    """YOLO bbox -> crop -> MediaPipe Face Mesh (468 landmark) -> convex hull.
+
+    - Landmark lưu theo toạ độ CHUẨN HÓA trong bbox (0..1), nên ở frame bỏ qua (FACE_MASK_EVERY_N) vẫn
+      chiếu lại đúng lên bbox mới của YOLO, và không bị lệch khi zoom bật/tắt.
+    - Lọc EMA trên 468 điểm (số điểm cố định) rồi mới lấy hull -> hull ít rung.
+    - Chỉ dùng trong luồng engine (không thread-safe). Chỉ để HIỂN THỊ, không ảnh hưởng tâm bbox gửi ESP32.
+    """
+
+    def __init__(self):
+        if mp is None:
+            raise RuntimeError("chưa cài mediapipe (pip install mediapipe)")
+        self._lm = None
+        self._legacy = False
+        if hasattr(mp, "solutions"):  # mediapipe cũ
+            self._legacy = True
+            self._lm = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True, max_num_faces=1, refine_landmarks=False,
+                min_detection_confidence=0.5)
+        else:  # mediapipe mới: Tasks API, cần file .task
+            if not os.path.isfile(FACE_LANDMARKER_MODEL):
+                if not FACE_LANDMARKER_AUTODOWNLOAD:
+                    raise RuntimeError(f"thiếu {FACE_LANDMARKER_MODEL} (mediapipe mới cần face_landmarker.task)")
+                self._download_model()
+            from mediapipe.tasks.python import BaseOptions, vision
+            opts = vision.FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL),
+                running_mode=vision.RunningMode.IMAGE, num_faces=1,
+                min_face_detection_confidence=0.5, min_face_presence_confidence=0.5)
+            self._lm = vision.FaceLandmarker.create_from_options(opts)
+        self._state = {}  # tid -> {"pts": (468,2) float32 theo bbox, "ok": frame_idx lần thành công cuối}
+        self._tried = {}  # tid -> frame_idx lần thử cuối (để cách quãng EVERY_N cả khi thất bại)
+        self._fi = 0
+
+    @staticmethod
+    def _download_model():
+        import urllib.request
+        print(f"[MASK] đang tải face_landmarker.task -> {FACE_LANDMARKER_MODEL}")
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(FACE_LANDMARKER_MODEL)), exist_ok=True)
+            tmp = FACE_LANDMARKER_MODEL + ".part"
+            with urllib.request.urlopen(FACE_LANDMARKER_URL, timeout=30) as r, open(tmp, "wb") as f:
+                f.write(r.read())
+            os.replace(tmp, FACE_LANDMARKER_MODEL)
+        except Exception as e:
+            raise RuntimeError(f"không tải được face_landmarker.task ({e}); tải tay từ {FACE_LANDMARKER_URL} "
+                               f"rồi đặt vào {FACE_LANDMARKER_MODEL}")
+
+    def close(self):
+        try:
+            if self._lm is not None:
+                self._lm.close()
+        except Exception:
+            pass
+
+    def _run(self, rgb):
+        """-> (N,2) float32 chuẩn hóa theo crop, hoặc None."""
+        if self._legacy:
+            res = self._lm.process(rgb)
+            if not res.multi_face_landmarks:
+                return None
+            lms = res.multi_face_landmarks[0].landmark
+        else:
+            img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+            res = self._lm.detect(img)
+            if not res.face_landmarks:
+                return None
+            lms = res.face_landmarks[0]
+        return np.array([(p.x, p.y) for p in lms], dtype=np.float32)
+
+    def _detect(self, frame, box):
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        H, W = frame.shape[:2]
+        cx1 = max(0, int(x1 - FACE_MASK_PAD * bw))
+        cy1 = max(0, int(y1 - FACE_MASK_PAD * bh))
+        cx2 = min(W, int(x2 + FACE_MASK_PAD * bw))
+        cy2 = min(H, int(y2 + FACE_MASK_PAD * bh))
+        crop = frame[cy1:cy2, cx1:cx2]
+        ch, cw = crop.shape[:2]
+        if ch < 8 or cw < 8:
+            return None
+        lms = self._run(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        if lms is None:
+            return None
+        ax = cx1 + lms[:, 0] * cw  # crop -> toạ độ frame
+        ay = cy1 + lms[:, 1] * ch
+        return np.stack([(ax - x1) / bw, (ay - y1) / bh], axis=1).astype(np.float32)  # frame -> theo bbox
+
+    def update(self, frame, tracks, follow_id):
+        """-> {tid: hull int32 (N,1,2)} theo toạ độ frame đang đưa vào model."""
+        self._fi += 1
+        if FACE_MASK_ONLY_TARGET:
+            ids = [follow_id] if follow_id in tracks else []
+        else:
+            ids = list(tracks)
+        for tid in [t for t in self._state if t not in ids]:  # dọn id không còn dùng
+            self._state.pop(tid, None)
+            self._tried.pop(tid, None)
+
+        H, W = frame.shape[:2]
+        hulls = {}
+        for tid in ids:
+            x1, y1, x2, y2, _ = tracks[tid]
+            bw, bh = x2 - x1, y2 - y1
+            if bw < FACE_MASK_MIN_PX or bh < FACE_MASK_MIN_PX:
+                continue
+            if self._fi - self._tried.get(tid, -10 ** 9) >= FACE_MASK_EVERY_N:
+                self._tried[tid] = self._fi
+                new = self._detect(frame, (x1, y1, x2, y2))
+                if new is not None:
+                    old = self._state.get(tid)
+                    pts = new if old is None else old["pts"] + FACE_MASK_SMOOTH * (new - old["pts"])
+                    self._state[tid] = {"pts": pts, "ok": self._fi}
+            st = self._state.get(tid)
+            if st is None:
+                continue
+            if self._fi - st["ok"] > FACE_MASK_HOLD_FRAMES:  # mất mặt quá lâu -> bỏ mask
+                self._state.pop(tid, None)
+                continue
+            absp = np.array([x1, y1], np.float32) + st["pts"] * np.array([bw, bh], np.float32)
+            absp[:, 0] = np.clip(absp[:, 0], 0, W - 1)
+            absp[:, 1] = np.clip(absp[:, 1], 0, H - 1)
+            hulls[tid] = cv2.convexHull(absp.astype(np.int32))
+        return hulls
+
+
+def draw_face_masks(frame, hulls, follow_id=None):
+    """Vẽ overlay trong suốt + viền cho từng hull, sửa trực tiếp `frame`. Chỉ xử lý trong bounding rect của hull."""
+    H, W = frame.shape[:2]
+    for tid, hull in hulls.items():
+        color = FACE_MASK_COLOR if tid == follow_id else FACE_MASK_COLOR_OTHER
+        x, y, w, h = cv2.boundingRect(hull)
+        x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        roi = frame[y0:y1, x0:x1]  # view: ghi vào roi là ghi vào frame
+        m = np.zeros(roi.shape[:2], np.uint8)
+        cv2.fillConvexPoly(m, hull - np.array([x0, y0], np.int32), 255)
+        layer = np.empty_like(roi)
+        layer[:] = color
+        blended = cv2.addWeighted(roi, 1.0 - FACE_MASK_ALPHA, layer, FACE_MASK_ALPHA, 0)
+        roi[m > 0] = blended[m > 0]
+        cv2.polylines(frame, [hull], True, color, FACE_MASK_OUTLINE_PX, cv2.LINE_AA)
+
+
 # ======================= ENGINE =======================
 class TrackingEngine(threading.Thread):
     """Luồng chạy chương trình chính. GUI chỉ cần: snapshot(), set_lock(), toggle_lock(),
@@ -546,6 +717,8 @@ class TrackingEngine(threading.Thread):
         self._params_mu = threading.Lock()
         self._dist = None
         self._zoom = ZoomController()
+        self._masker = None
+        self.mask_text = "-"  # trạng thái mask hiển thị ở GUI
         self.ready = threading.Event()
         self.status = "khởi động..."
         self.error = None
@@ -640,6 +813,17 @@ class TrackingEngine(threading.Thread):
 
             self.status = "đang mở camera..."
             cam = CameraStream().start()
+            if not FACE_MASK_ENABLE:
+                self.mask_text = "tắt (FACE_MASK_ENABLE=False)"
+            else:
+                try:
+                    self.status = "đang nạp mask khuôn mặt..."
+                    self._masker = FaceMasker()
+                    self.mask_text = "sẵn sàng"
+                except Exception as e:  # thiếu mediapipe / thiếu file .task -> chạy tiếp, không mask
+                    self._masker = None
+                    self.mask_text = f"TẮT: {e}"
+                    print(f"[MASK] tắt mask khuôn mặt: {e}")
             self.push_all()  # đẩy toàn bộ tham số sang ESP32 ngay khi sẵn sàng
             self.ready.set()
             self._loop(model, kw, cam)
@@ -650,6 +834,8 @@ class TrackingEngine(threading.Thread):
             send_error(0.0, 0.0, False)  # báo "không mục tiêu" để servo không bám theo giá trị cũ
             if self._dist is not None:
                 self._dist.stop()
+            if self._masker is not None:
+                self._masker.close()
             if cam is not None:
                 cam.stop()
             serial_close()
@@ -733,9 +919,20 @@ class TrackingEngine(threading.Thread):
                     print(f"[FPS] cam={cam.fps:5.1f} | infer={infer_fps:5.1f} | target={has_target} | "
                           f"err_x={ex:+7.1f} | err_y={ey:+7.1f} | dist={d} | zoom={'x%g' % ZOOM_FACTOR if zoomed else 'off'}")
 
+                # Mask khuôn mặt: chạy SAU send_error để không làm trễ lệnh servo, và nằm ngoài infer_ms
+                hulls, mask_ms = {}, 0.0
+                if self._masker is not None and tracks:
+                    t_m = time.perf_counter()
+                    hulls = self._masker.update(frame, tracks, follow_id)
+                    if FACE_MASK_DRAW and hulls:
+                        draw_face_masks(frame, hulls, follow_id)
+                    mask_ms = (time.perf_counter() - t_m) * 1000.0
+                    self.mask_text = f"bật  {mask_ms:.1f} ms" if hulls else "không thấy mặt trong box"
+
                 with self._mu:
                     self._n += 1
                     self._snap = dict(n=self._n, frame=frame, tracks=tracks,
+                                      face_hulls=hulls, mask_ms=mask_ms,
                                       follow_id=follow_id, state=state, locked=self._locked_id,
                                       ex=ex, ey=ey, cam_fps=cam.fps, infer_fps=infer_fps,
                                       infer_ms=infer_ms, dist_state=dist_state, dist_mm=dist_mm,
