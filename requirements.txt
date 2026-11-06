@@ -48,8 +48,6 @@ onnxruntime==1.30.0
 onnxruntime-gpu==1.22.0
 onnxscript==0.7.2
 onnxslim==0.1.96
-opencv-contrib-python==5.0.0.93
-opencv-python==5.0.0.93
 packaging==26.3
 pandas==3.0.6
 pillow==12.3.0

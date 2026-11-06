@@ -116,8 +116,8 @@ cd pan_tilt_head_tracking_camera
 
 python -m venv .venv
 .venv\Scripts\activate          # Windows
-
-pip install -r requirements.txt
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
+pip install opencv-python==5.0.0.93 opencv-contrib-python==5.0.0.93
 ```
 
 > ⚠️ **Avoid non-ASCII characters in the project path** (e.g., Vietnamese diacritics): MediaPipe crashes when the path contains them. Use a plain ASCII path such as `E:\pan_tilt_head_tracking_camera`. Also note that renaming or moving the project folder breaks the `.venv`; run `pip freeze > requirements.txt` beforehand and recreate the environment afterwards.
