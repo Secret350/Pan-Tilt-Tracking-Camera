@@ -25,6 +25,8 @@ video/
 ndung_bcao/
 *.json
 *.csv
+*.drawio
+*.bkp
 
 # IDE
 .vscode/
