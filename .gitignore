@@ -23,7 +23,6 @@ train/weights
 # Others
 video/
 ndung_bcao/
-*.json
 *.csv
 *.drawio
 *.bkp
