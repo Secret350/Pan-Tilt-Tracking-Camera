@@ -23,6 +23,8 @@ train/weights
 # Others
 video/
 ndung_bcao/
+*.json
+*.csv
 
 # IDE
 .vscode/
