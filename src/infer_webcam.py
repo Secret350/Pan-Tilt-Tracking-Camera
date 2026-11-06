@@ -38,6 +38,8 @@ import time
 import collections
 import statistics
 
+from eval.eval_sys.prob_cam import CAMERA_INDEX
+
 os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 
 import cv2
@@ -59,8 +61,29 @@ DIST_MEDIAN_N = 30  # lọc median 5 mẫu gần nhất (khử nhiễu xung)
 DIST_MAX_AGE_S = 0.4  # thời gian đợi trước khi coi như mất dữ liệu từ sensor
 DIST_GATE_ERR_PX = 80  # chỉ tin khoảng cách khi |errx|,|erry| nhỏ hơn mức này
 
+# --- Đo khoảng cách bằng thị giác (OpenCV), hiển thị song song với VL53L0X để so sánh ---
+#   "pnp" : cv2.solvePnP (SQPNP + LM) trên 14 landmark MediaPipe + mô hình mặt 3D chuẩn -> độ sâu Z của đỉnh mũi.
+#           Cần FACE_MASK_ENABLE (lấy landmark từ MediaPipe), chạy theo nhịp FACE_MASK_EVERY_N.
+#   "bbox": tam giác đồng dạng Z = f * bề_ngang_đầu_thật / bề_ngang_box. Chạy mọi frame, không cần MediaPipe.
+DIST_VISION_ENABLE = True
+CAM_FOCAL_PX = None  # tiêu cự (px) ở độ phân giải CAP_WIDTH, khung chưa zoom. None: suy từ thanh trượt hfov.
+#                      CHỈ đúng nếu hfov = FOV ngang THẬT của webcam (sai tiêu cự là nguồn lỗi lớn nhất). Đã hiệu chuẩn bằng
+#                      cv2.calibrateCamera thì nhập fx ở đây.
+HEAD_WIDTH_CM = 15.3  # bề ngang đầu cho "bbox" (lấy từ mô hình mặt chuẩn: khoảng cách hai má). Box "head" thật có thể rộng hơn (tóc, tai) -> k sửa
+HEAD_DEPTH_CM = 9.9  # "bbox" đo tới mặt phẳng hai má, nằm sau đỉnh mũi chừng này (cũng từ mô hình chuẩn); cảm biến thì đo tới mũi nên phải trừ đi
+DIST_PNP_SCALE = 1.0  # hệ số nhân sửa kết quả "pnp". Sửa bằng: giá trị hiện tại x k hiển thị ở GUI (k ≈ 1.00 là khớp)
+DIST_BBOX_SCALE = 1.0  # tương tự cho "bbox"
+DIST_VISION_MEDIAN_N = 5  # median các ước lượng gần nhất cho đỡ nhảy
+DIST_VISION_MAX_AGE_S = 0.5  # quá lâu không có ước lượng mới thì bỏ số cũ
+DIST_VISION_MIN_CM = 10.0  # ngoài khoảng [MIN, MAX] coi là rác
+DIST_VISION_MAX_CM = 400.0
+DIST_PNP_MAX_REPROJ = 0.08  # bỏ kết quả PnP nếu sai số tái chiếu (RMS px) / bề ngang landmark lớn hơn mức này (chưa tune trên dữ liệu thật)
+DIST_CMP_WINDOW = 300  # số cặp (sensor, thị giác) gần nhất dùng tính MAE / k
+DIST_CMP_MAX_SPREAD_MM = 40  # chỉ ghi cặp so sánh khi các mẫu sensor gần nhất dao động <= mức này (median của sensor bị trễ khi người đang di chuyển)
+
 # --- Camera ---
-CAMERA_INDEX = 1
+CAMERA_INDEX=0
+# CAMERA_INDEX = 1
 CAP_BACKEND = "MSMF"  # đã probe: MSMF cho ~28.9 fps ở 1280x720 (backend tốt nhất trên thiết bị)
 CAP_FOURCC_FIRST = False  # MSMF bỏ qua FOURCC nên FALSE/TRUE đều cho 28.9 fps;
 # giữ False để nếu phải rơi về DSHOW thì vẫn đặt MJPG đúng thứ tự
@@ -324,8 +347,128 @@ class DistanceReader:
         state, mm = self.read()
         return mm if state == "OK" else None
 
+    def spread_mm(self):
+        """Độ dao động (max - min, mm) của các mẫu hợp lệ gần nhất; None nếu chưa đủ mẫu."""
+        with self._lock:
+            if len(self._buf) < max(3, DIST_MEDIAN_N // 2):
+                return None
+            return max(self._buf) - min(self._buf)
+
     def stop(self):
         self._run = False
+
+
+# ======================= ĐO KHOẢNG CÁCH BẰNG THỊ GIÁC =======================
+# 14 landmark MediaPipe và toạ độ 3D (cm) của chúng trong canonical_face_model.obj của MediaPipe (Apache-2.0).
+# Quy ước gốc của file: x sang phải, y lên trên, z về phía camera. Hàng đầu (landmark 1) là đỉnh mũi.
+_PNP_LM_IDX = [1, 168, 33, 133, 362, 263, 129, 358, 61, 291, 0, 17, 152, 10]
+_PNP_MODEL_MP = np.array([
+    [0.000, -1.127, 7.476],  # 1   đỉnh mũi
+    [0.000, 3.271, 5.236],  # 168 sống mũi giữa hai mắt
+    [-4.446, 2.664, 3.173],  # 33  khóe ngoài mắt
+    [-1.856, 2.585, 3.758],  # 133 khóe trong mắt
+    [1.856, 2.585, 3.758],  # 362 khóe trong mắt
+    [4.446, 2.664, 3.173],  # 263 khóe ngoài mắt
+    [-1.786, -0.978, 4.850],  # 129 cánh mũi
+    [1.786, -0.978, 4.850],  # 358 cánh mũi
+    [-2.456, -4.343, 4.284],  # 61  khóe miệng
+    [2.456, -4.343, 4.284],  # 291 khóe miệng
+    [0.000, -3.406, 5.980],  # 0   môi trên
+    [0.000, -5.365, 5.535],  # 17  môi dưới
+    [0.000, -9.403, 4.264],  # 152 cằm
+    [0.000, 8.262, 4.482],  # 10  trán
+], dtype=np.float64)
+# Đổi sang quy ước OpenCV (x phải, y xuống, z ra xa camera) và dời gốc về đỉnh mũi: khi đó tvec của
+# solvePnP là vị trí đỉnh mũi trong hệ camera, tvec[2] = độ sâu (cm) của mũi - điểm gần cảm biến nhất.
+_PNP_MODEL = _PNP_MODEL_MP * np.array([1.0, -1.0, -1.0])
+_PNP_MODEL = _PNP_MODEL - _PNP_MODEL[0]
+
+
+class VisionDistance:
+    """Ước lượng khoảng cách (cm) từ ảnh bằng OpenCV và so với cảm biến.
+
+    Hai phương pháp chạy song song (xem khối cấu hình DIST_VISION_*): 'pnp' và 'bbox'.
+    Cặp (sensor, pnp, bbox) chỉ được ghi khi đủ tin cậy; thống kê trên cửa sổ trượt DIST_CMP_WINDOW.
+    Gọi từ luồng engine, ngoại trừ reset_stats() có thể gọi từ GUI (đã khóa).
+    """
+
+    def __init__(self):
+        self._v = {"pnp": collections.deque(maxlen=DIST_VISION_MEDIAN_N),
+                   "bbox": collections.deque(maxlen=DIST_VISION_MEDIAN_N)}
+        self._t = {"pnp": 0.0, "bbox": 0.0}
+        self._pairs = collections.deque(maxlen=DIST_CMP_WINDOW)  # (sensor, pnp, bbox) cm; NaN nếu thiếu
+        self._mu = threading.Lock()
+
+    def _push(self, key, cm, now):
+        if not (DIST_VISION_MIN_CM <= cm <= DIST_VISION_MAX_CM):
+            return
+        if now - self._t[key] > DIST_VISION_MAX_AGE_S:
+            self._v[key].clear()  # mục tiêu vừa xuất hiện lại: bỏ số cũ để median không bị trộn
+        self._v[key].append(cm)
+        self._t[key] = now
+
+    def update_bbox(self, box, fx, now):
+        w = box[2] - box[0]
+        if w >= 4:
+            self._push("bbox", (fx * HEAD_WIDTH_CM / w - HEAD_DEPTH_CM) * DIST_BBOX_SCALE, now)
+
+    def update_pnp(self, lm, fx, fy, cx, cy, now):
+        """lm: (468,2) landmark theo pixel của khung đang đưa vào model (đã tính cả zoom số)."""
+        img = np.ascontiguousarray(lm[_PNP_LM_IDX], dtype=np.float64)
+        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        try:
+            ok, rvec, tvec = cv2.solvePnP(_PNP_MODEL, img, K, None, flags=cv2.SOLVEPNP_SQPNP)
+            if not ok:
+                return
+            rvec, tvec = cv2.solvePnPRefineLM(_PNP_MODEL, img, K, None, rvec, tvec)
+            z = float(tvec[2, 0])
+            if z <= 0.0:
+                return
+            proj, _ = cv2.projectPoints(_PNP_MODEL, rvec, tvec, K, None)
+        except cv2.error:
+            return
+        rms = float(np.sqrt(np.mean(np.sum((proj.reshape(-1, 2) - img) ** 2, axis=1))))
+        if rms / max(1.0, float(np.ptp(img[:, 0]))) > DIST_PNP_MAX_REPROJ:
+            return
+        self._push("pnp", z * DIST_PNP_SCALE, now)
+
+    def read(self, now):
+        """-> {'pnp': cm|None, 'bbox': cm|None} (median các mẫu gần nhất còn mới)."""
+        out = {}
+        for key in ("pnp", "bbox"):
+            d = self._v[key]
+            fresh = bool(d) and now - self._t[key] <= DIST_VISION_MAX_AGE_S
+            out[key] = float(statistics.median(d)) if fresh else None
+        return out
+
+    def add_pair(self, sensor_cm, vals):
+        if vals["pnp"] is None and vals["bbox"] is None:
+            return
+        nan = float("nan")
+        with self._mu:
+            self._pairs.append((sensor_cm, nan if vals["pnp"] is None else vals["pnp"],
+                                nan if vals["bbox"] is None else vals["bbox"]))
+
+    def reset_stats(self):
+        with self._mu:
+            self._pairs.clear()
+
+    def stats(self):
+        """-> {'n': số cặp, 'pnp'|'bbox': None | {n, mae (cm), bias_pct, k}}.
+        k = median(sensor / thị_giác): hệ số cần NHÂN THÊM vào giá trị đang hiển thị để khớp cảm biến."""
+        with self._mu:
+            a = np.array(self._pairs, dtype=np.float64).reshape(-1, 3)
+        out = {"n": int(len(a))}
+        for j, key in ((1, "pnp"), (2, "bbox")):
+            m = ~np.isnan(a[:, j]) if len(a) else np.zeros(0, bool)
+            if int(m.sum()) < 3:
+                out[key] = None
+                continue
+            s, v = a[m, 0], a[m, j]
+            e = v - s
+            out[key] = dict(n=int(m.sum()), mae=float(np.mean(np.abs(e))),
+                            bias_pct=float(np.mean(e / s) * 100.0), k=float(np.median(s / v)))
+        return out
 
 
 # ======================= ZOOM SỐ =======================
@@ -644,6 +787,9 @@ class FaceMasker:
         self._state = {}  # tid -> {"pts": (468,2) float32 theo bbox, "ok": frame_idx lần thành công cuối}
         self._tried = {}  # tid -> frame_idx lần thử cuối (để cách quãng EVERY_N cả khi thất bại)
         self._fi = 0
+        # tid -> (468,2) landmark THÔ (chưa EMA) theo pixel khung, chỉ có ở frame vừa chạy MediaPipe. Dùng cho PnP:
+        # landmark tính trực tiếp từ crop nên không phụ thuộc bề ngang box YOLO (khác với hull đã chiếu lại lên box).
+        self.fresh = {}
 
     @staticmethod
     def _download_model():
@@ -703,6 +849,7 @@ class FaceMasker:
     def update(self, frame, tracks, follow_id):
         """-> {tid: hull int32 (N,1,2)} theo toạ độ frame đang đưa vào model."""
         self._fi += 1
+        self.fresh = {}
         if FACE_MASK_ONLY_TARGET:
             ids = [follow_id] if follow_id in tracks else []
         else:
@@ -722,6 +869,7 @@ class FaceMasker:
                 self._tried[tid] = self._fi
                 new = self._detect(frame, (x1, y1, x2, y2))
                 if new is not None:
+                    self.fresh[tid] = np.array([x1, y1], np.float32) + new * np.array([bw, bh], np.float32)
                     old = self._state.get(tid)
                     pts = new if old is None else old["pts"] + FACE_MASK_SMOOTH * (new - old["pts"])
                     self._state[tid] = {"pts": pts, "ok": self._fi}
@@ -777,6 +925,7 @@ class TrackingEngine(threading.Thread):
         self._dist = None
         self._zoom = ZoomController()
         self._masker = None
+        self._vis = VisionDistance() if DIST_VISION_ENABLE else None
         self.mask_text = "-"  # trạng thái mask hiển thị ở GUI
         self.ready = threading.Event()
         self.status = "khởi động..."
@@ -816,6 +965,11 @@ class TrackingEngine(threading.Thread):
             items = list(self._params.items())
         for name, value in items:
             send_param(name, value)
+
+    def reset_dist_stats(self):
+        """GUI gọi (phím r): xóa cửa sổ so sánh sensor / thị giác."""
+        if self._vis is not None:
+            self._vis.reset_stats()
 
     def stop(self):
         self._stop_evt.set()
@@ -910,7 +1064,7 @@ class TrackingEngine(threading.Thread):
         if LOG_CSV_ENABLE:
             csv_f = open(LOG_CSV_PATH, "w", newline="")
             csv_w = csv.writer(csv_f)
-            csv_w.writerow(["t_s", "err_x", "err_y", "has_target", "infer_ms", "dist_mm", "zoom"])
+            csv_w.writerow(["t_s", "err_x", "err_y", "has_target", "infer_ms", "dist_mm", "zoom", "pnp_cm", "bbox_cm"])
         try:
             while not self._stop_evt.is_set():
                 last_id, frame = cam.read(last_id)
@@ -969,10 +1123,6 @@ class TrackingEngine(threading.Thread):
                     self.push_all()
                     t_param = now
 
-                if csv_w is not None:
-                    csv_w.writerow([f"{now - t_start:.4f}", f"{ex:.1f}", f"{ey:.1f}", int(has_target),
-                                    f"{infer_ms:.1f}", "" if dist_mm is None else dist_mm, int(zoomed)])
-
                 if LOG_INTERVAL_SEC > 0 and now - t_log >= LOG_INTERVAL_SEC:
                     t_log = now
                     d = f"{dist_mm}mm" if dist_mm is not None else dist_state
@@ -989,9 +1139,41 @@ class TrackingEngine(threading.Thread):
                     mask_ms = (time.perf_counter() - t_m) * 1000.0
                     self.mask_text = f"bật  {mask_ms:.1f} ms" if hulls else "không thấy mặt trong box"
 
+                # Đo khoảng cách bằng thị giác, song song với cảm biến (cũng chạy SAU send_error, ngoài infer_ms)
+                vis, vis_stats, vis_ms = {"pnp": None, "bbox": None}, {"n": 0}, 0.0
+                if self._vis is not None:
+                    t_v = time.perf_counter()
+                    if has_target:
+                        with self._params_mu:
+                            hfov = float(self._params.get("hfov", 65.0))
+                        if CAM_FOCAL_PX:
+                            f0 = CAM_FOCAL_PX * w / CAP_WIDTH
+                        else:
+                            f0 = (w / 2.0) / np.tan(np.radians(hfov) / 2.0)
+                        fx, fy = f0 * zx, f0 * zy  # zoom số = cắt giữa khung rồi phóng to -> tiêu cự hiệu dụng tăng theo
+                        self._vis.update_bbox(tracks[follow_id], fx, now)
+                        lm = self._masker.fresh.get(follow_id) if self._masker is not None else None
+                        if lm is not None:
+                            self._vis.update_pnp(lm, fx, fy, w / 2.0, h / 2.0, now)
+                    vis = self._vis.read(now)
+                    spread = self._dist.spread_mm() if self._dist is not None else None
+                    if (gated and dist_state == "OK" and spread is not None
+                            and spread <= DIST_CMP_MAX_SPREAD_MM):
+                        self._vis.add_pair(dist_mm / 10.0, vis)
+                    vis_stats = self._vis.stats()
+                    vis_ms = (time.perf_counter() - t_v) * 1000.0
+
+                if csv_w is not None:
+                    csv_w.writerow([f"{now - t_start:.4f}", f"{ex:.1f}", f"{ey:.1f}", int(has_target),
+                                    f"{infer_ms:.1f}", "" if dist_mm is None else dist_mm, int(zoomed),
+                                    "" if vis["pnp"] is None else f"{vis['pnp']:.1f}",
+                                    "" if vis["bbox"] is None else f"{vis['bbox']:.1f}"])
+
                 with self._mu:
                     self._n += 1
                     self._snap = dict(n=self._n, frame=frame, tracks=tracks,
+                                      dist_vis=dict(pnp_cm=vis["pnp"], bbox_cm=vis["bbox"],
+                                                    stats=vis_stats, ms=vis_ms),
                                       face_hulls=hulls, mask_ms=mask_ms,
                                       follow_id=follow_id, state=state, locked=self._locked_id,
                                       ex=ex, ey=ey, cam_fps=cam.fps, infer_fps=infer_fps,

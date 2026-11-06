@@ -73,7 +73,33 @@ def dist_text(dist_state, dist_mm):
             "NO_SERIAL": "tắt", "NO_DATA": "--"}.get(dist_state, "--")
 
 
-def annotate(frame, tracks, follow_id, state, dist_state, dist_mm, zoom_active):
+def _cm(v):
+    return "--" if v is None else f"{v:.1f}"
+
+
+def vision_rows(dv, dist_state, dist_mm):
+    """Định dạng 2 dòng Status so sánh thị giác với cảm biến.
+    -> (chữ "đo ảnh", có_số, chữ "so sánh", có_cặp). Trong ngoặc là chênh lệch (thị giác - sensor), cm."""
+    s_cm = dist_mm / 10.0 if dist_state == "OK" and dist_mm is not None else None
+
+    def one(name, v):
+        if v is None:
+            return f"{name} --"
+        return f"{name} {v:5.1f}" + (f" ({v - s_cm:+.1f})" if s_cm is not None else "")
+
+    p, b = dv.get("pnp_cm"), dv.get("bbox_cm")
+    row1 = f"{one('PnP', p)}    {one('bbox', b)}    cm"
+    st = dv.get("stats") or {}
+    if not st.get("n"):
+        return row1, (p is not None or b is not None), "chưa có cặp (cần sensor OK, mặt ở giữa, sensor ổn định)", False
+    mp_, mb = st.get("pnp"), st.get("bbox")
+    mae = lambda m: "--" if m is None else f"{m['mae']:.1f}"
+    kk = lambda m: "--" if m is None else f"{m['k']:.2f}"
+    row2 = f"n={st['n']}  MAE pnp {mae(mp_)} / bbox {mae(mb)} cm   k {kk(mp_)} / {kk(mb)}"
+    return row1, (p is not None or b is not None), row2, True
+
+
+def annotate(frame, tracks, follow_id, state, dist_state, dist_mm, zoom_active, dist_vis=None):
     """Resize về DISPLAY_W rồi vẽ box/ID/khoảng cách. Trả về (ảnh RGB, scale)."""
     h, w = frame.shape[:2]
     s = DISPLAY_W / w
@@ -105,6 +131,10 @@ def annotate(frame, tracks, follow_id, state, dist_state, dist_mm, zoom_active):
     y = _chip(img, banner, 8, ACCENT_BGR, (255, 255, 255))
     y = _chip(img, f"DIST {dist_text(dist_state, dist_mm)}", y + 6,
               (60, 60, 60) if dist_state == "OK" else (150, 150, 150), (255, 255, 255))
+    if dist_vis is not None and core.DIST_VISION_ENABLE:
+        has = dist_vis.get("pnp_cm") is not None or dist_vis.get("bbox_cm") is not None
+        y = _chip(img, f"PnP {_cm(dist_vis.get('pnp_cm'))} | BOX {_cm(dist_vis.get('bbox_cm'))} cm",
+                  y + 6, (60, 60, 60) if has else (150, 150, 150), (255, 255, 255))
     if zoom_active:
         _chip(img, f"ZOOM x{core.ZOOM_FACTOR:g}", y + 6, (255, 255, 255), ACCENT_BGR)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), s
@@ -184,6 +214,7 @@ class App(tk.Tk):
         self.bind("<Key-s>", lambda _e: self.save())
         self.bind("<Control-s>", lambda _e: self.save())
         self.bind("<Key-q>", lambda _e: self._on_close())
+        self.bind("<Key-r>", lambda _e: self.engine.reset_dist_stats())  # xóa cửa sổ so sánh sensor / thị giác
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(15, self._tick)
 
@@ -219,7 +250,7 @@ class App(tk.Tk):
         hd.pack(fill="x", padx=18, pady=(14, 10))
         tk.Label(hd, text=" Pan-Tilt Tracking", fg=TEXT, bg=BG, font=self.f(19, True)).pack(side="left")
         tk.Label(hd, text="  head tracking → ESP32", fg=MUTED, bg=BG, font=self.f(13)).pack(side="left", pady=(7, 0))
-        tk.Label(hd, text="esc auto · s save · q quit", fg=MUTED, bg=BG,
+        tk.Label(hd, text="esc auto · s save · r reset so sánh · q quit", fg=MUTED, bg=BG,
                  font=self.f(12)).pack(side="right", pady=(7, 0))
 
         body = tk.Frame(self, bg=BG)
@@ -248,7 +279,7 @@ class App(tk.Tk):
         grid = tk.Frame(scard, bg=CARD)
         grid.pack(fill="x", padx=14, pady=10)
         self.sv, self.sl = {}, {}
-        rows = [("mode", "●"), ("error", "⎿"), ("speed", "⎿"), ("sensor", "⎿"), ("zoom", "⎿"),
+        rows = [("mode", "●"), ("error", "⎿"), ("speed", "⎿"), ("sensor", "⎿"), ("đo ảnh", "⎿"), ("so sánh", "⎿"), ("zoom", "⎿"),
                 ("serial", "⎿"), ("mask", "⎿"), ("model", "⎿")]
         for i, (key, glyph) in enumerate(rows):
             tk.Label(grid, text=glyph, fg=ACCENT if i == 0 else MUTED, bg=CARD,
@@ -405,7 +436,8 @@ class App(tk.Tk):
 
     def _show(self, snap):
         img, self._scale = annotate(snap["frame"], snap["tracks"], snap["follow_id"], snap["state"],
-                                    snap["dist_state"], snap["dist_mm"], snap["zoom_active"])
+                                    snap["dist_state"], snap["dist_mm"], snap["zoom_active"],
+                                    dist_vis=snap.get("dist_vis"))
         ih, iw = img.shape[:2]
         if (iw, ih) != self._img_size:
             self._img_size = (iw, ih)
@@ -450,6 +482,17 @@ class App(tk.Tk):
         else:
             self.sv["sensor"].set("chưa nhận được dữ liệu")
             self.sl["sensor"].config(fg=MUTED)
+        if not core.DIST_VISION_ENABLE:
+            self.sv["đo ảnh"].set("tắt (DIST_VISION_ENABLE=False)")
+            self.sv["so sánh"].set("-")
+            self.sl["đo ảnh"].config(fg=MUTED)
+            self.sl["so sánh"].config(fg=MUTED)
+        else:
+            r1, ok1, r2, ok2 = vision_rows(snap.get("dist_vis") or {}, ds, dmm)
+            self.sv["đo ảnh"].set(r1)
+            self.sl["đo ảnh"].config(fg=TEXT if ok1 else MUTED)
+            self.sv["so sánh"].set(r2)
+            self.sl["so sánh"].config(fg=TEXT if ok2 else MUTED)
         if not core.ZOOM_ENABLE:
             self.sv["zoom"].set("tắt (ZOOM_ENABLE=False)")
             self.sl["zoom"].config(fg=MUTED)
