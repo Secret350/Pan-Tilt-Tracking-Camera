@@ -88,7 +88,7 @@ This is a **decoupled perception–control architecture**: the compute-heavy, no
 - **Common ground** is required between the power supply, the servos, and the ESP32.
 - The TOF400C - VL53L1X was verified with an I2C scanner at address `0x29`.
 
-[//]: # (Bản vẽ kĩ thuật và bản vẽ 3D)
+![Elec_wiring](project_des/pan_tilt_elec_wiring.png)
 
 ## Software Stack
 
