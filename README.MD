@@ -2,10 +2,13 @@
 ### Yolo26s | Mediapipe | MG90S servo | ESP32DEVKITV1
 
 ![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python)
-![YOLO26s](https://img.shields.io/badge/YOLOv26s-Ultralytics-purple?logo=ultralytics)
+![YOLO26s](https://img.shields.io/badge/Ultralytics-YOLOv26s-purple?logo=ultralytics)
 ![ESP32](https://img.shields.io/badge/ESP32-DEVKITV1-orange?logo=)
 ![PyTorch](https://img.shields.io/badge/PyTorch-CUDA_13.0-red?logo=pytorch)
+![Kicad](https://img.shields.io/badge/Kicad-Kicad_10.0-navy?logo=kicad)
+![SolidWork](https://img.shields.io/badge/SolidWorks-SolidWorks_Student-red?logo=dassaultsystemes)
 ![License](https://img.shields.io/badge/License-Apache-green)
+
 
 A two-axis (pan-tilt) camera gimbal that performs **real-time head detection and closed-loop visual servoing** to keep a target centered in the field of view. Perception (detection, tracking, landmark extraction) runs on a GPU-equipped laptop, while low-level actuation (PID control of two servos) runs on an ESP32 microcontroller, linked over a wired serial channel. This project was developed as a coursework project for *Measurement and Control*.
 
@@ -20,15 +23,16 @@ A two-axis (pan-tilt) camera gimbal that performs **real-time head detection and
 1. [Key Features](#key-features)
 2. [System Architecture](#system-architecture)
 3. [Hardware](#hardware)
-4. [Wiring](#wiring)
-5. [Software Stack](#software-stack)
-6. [Installation](#installation)
-7. [Serial Protocol](#serial-protocol)
-8. [Control GUI](#control-gui)
-9. [Distance Estimation](#distance-estimation)
-10. [Experiments & Known Issues](#experiments--known-issues)
-11. [Future Work](#future-work)
-12. [License](#license)
+4. [Mechanical Design](#mechanical-design)
+5. [Wiring](#wiring)
+6. [Software Stack](#software-stack)
+7. [Installation](#installation)
+8. [Serial Protocol](#serial-protocol)
+9. [Control GUI](#control-gui)
+10. [Distance Estimation](#distance-estimation)
+11. [Experiments & Known Issues](#experiments--known-issues)
+12. [Contributors](#contributors)
+13. [License](#license)
 
 ---
 
@@ -66,6 +70,14 @@ This is a **decoupled perception–control architecture**: the compute-heavy, no
 | Actuators | 2 × MG90S micro servos (pan + tilt)                     |
 | Range sensor | TOF400C - VL53L1X ToF sensor (I2C)                      |
 | Servo power | AC–DC switching-mode 5V-2A power supply                 |
+
+## Mechanical Design
+
+The pan-tilt mechanism was designed in **SolidWorks (Student Edition)**. The pan axis rotates about the vertical axis, and the tilt axis raises and lowers the camera. Both axes are driven directly by MG90S servos.
+
+### Assembly overview
+
+![Mechanical_assembly](project_des/mechanic.png)
 
 ### Mechanical layout
 
@@ -112,7 +124,7 @@ This is a **decoupled perception–control architecture**: the compute-heavy, no
 
 ```bash
 git clone https://github.com/Secret350/Pan-Tilt-Tracking-Camera.git
-cd pan_tilt_head_tracking_camera
+cd Pan-Tilt-Tracking-Camera
 
 python -m venv .venv
 .venv\Scripts\activate          # Windows
@@ -186,12 +198,22 @@ The goal is to quantify the discrepancy between the two methods across distances
 - **MediaPipe crash** caused by a non-ASCII project path. Resolved by moving to an ASCII-only path.
 - **Power supply constraint (resolved):** the initial setup powered the servos from a 4×AA series pack of single-use alkaline cells (no rechargeable NiMH was available), which is subject to voltage sag under servo load and gradual discharge. This was resolved by switching to an **AC–DC switching-mode power supply (SMPS)**, which provides a stable DC supply for the servos independent of battery state.
 
+## Contributors
 
-## Future Work
+This project was developed as a coursework project for *Measurement and Control*.
 
-- Finish PID tuning to minimize overshoot and maximize smoothness.
-- Complete the quantitative comparison between the TOF400C-VL53L1X and camera-based distance estimates.
-- Reduce end-to-end latency (capture → inference → serial → actuation).
+| Name                | Student ID | Role / Responsibilities | GitHub                                          |
+|---------------------|------------|---|-------------------------------------------------|
+| Nguyễn Đức Minh Trí | 2024602732 | Perception pipeline (YOLO26s, tracking), GUI, serial protocol | [@Secret350](https://github.com/Secret350)      |
+| Phùng Xuân Tuân     | 2024602626 | Mechanical design in SolidWorks | [@PhungXuanTuan](https://github.com/PhungXuanTuan) |
+| Lê Quang Dũng       | 2024605831 | Electrical wiring, KiCad schematic | _                                               |
+**Institution:** Hanoi University of Industry (HaUI)
+
+### Acknowledgements
+
+- [Ultralytics](https://github.com/ultralytics/ultralytics) for YOLO26s
+- [Google MediaPipe](https://github.com/google-ai-edge/mediapipe) for face landmark extraction
+- [Pololu VL53L1X library](https://github.com/pololu/vl53l1x-arduino) for the ToF sensor driver
 
 ## License
 

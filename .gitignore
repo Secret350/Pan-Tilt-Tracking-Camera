@@ -26,7 +26,11 @@ ndung_bcao/
 *.csv
 *.drawio
 *.bkp
+*.pdf
 
 # IDE
 .vscode/
 .idea/
+
+#file
+project_des/export_png.py
