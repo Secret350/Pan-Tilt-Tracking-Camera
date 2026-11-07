@@ -207,6 +207,7 @@ This project was developed as a coursework project for *Measurement and Control*
 | Nguyễn Đức Minh Trí | 2024602732 | Perception pipeline (YOLO26s, tracking), GUI, serial protocol | [@Secret350](https://github.com/Secret350)      |
 | Phùng Xuân Tuân     | 2024602626 | Mechanical design in SolidWorks | [@PhungXuanTuan](https://github.com/PhungXuanTuan) |
 | Lê Quang Dũng       | 2024605831 | Electrical wiring, KiCad schematic | _                                               |
+
 **Institution:** Hanoi University of Industry (HaUI)
 
 ### Acknowledgements
