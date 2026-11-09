@@ -2,11 +2,15 @@
  * Pan-Tilt face tracking - ESP32 DevKit V1 - PID (dạng vận tốc)
  * Nhận từ Python:  E,<error_x>,<error_y>,<has_target>\n   (115200 baud)
  *                  P,<tên_tham_số>,<giá_trị>\n   (chỉnh PID lúc chạy từ GUI, không cần nạp lại code)
+ *                  H,<pan>,<tilt>\n               (về vị trí Home)
+ * Gửi lên Python:  D,<khoảng_cách_mm>,<valid>\n   (VL53L1X, ~30 Hz; valid=0 nếu ngoài tầm / range_status != RangeValid)
+ *                  T,ERR\n                        (không tìm thấy VL53L1X, lặp lại mỗi 1 s)
  *   error_x > 0: mặt nằm bên PHẢI tâm khung
  *   error_y > 0: mặt nằm bên DƯỚI tâm khung
  * Pan  servo -> GPIO18
  * Tilt servo -> GPIO19
- * Thư viện: ESP32Servo
+ * TOF400C-VL53L1X -> SDA GPIO21, SCL GPIO22 (I2C 0x29), VCC = 3V3, XSHUT/GPIO1 để hở
+ * Thư viện: ESP32Servo, VL53L1X (Pololu)
  *
  * Kiến trúc:
  *   - Khi có GÓI MỚI (~fps inference): lọc EMA sai số -> PID -> vận tốc mong muốn vTarget
@@ -18,6 +22,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <Wire.h>
+#include <VL53L1X.h>
 
 // ================== CẤU HÌNH ==================
 const int PAN_PIN  = 18;
@@ -29,13 +35,21 @@ const int SERVO_MAX_US = 2400;
 const float PAN_HOME  = 90.0f;
 const float TILT_HOME = 130.0f;
 const float PAN_MIN  = 10.0f,  PAN_MAX  = 170.0f;
-const float TILT_MIN = 110.0f,  TILT_MAX = 180.0f;
+const float TILT_MIN = 90.0f,  TILT_MAX = 180.0f;
 
 // Đổi +1 <-> -1 nếu gimbal quay NGƯỢC (xa khỏi mặt)
 const int PAN_DIR  = -1;
 const int TILT_DIR = +1;
 
 const float FRAME_W_PX = 1280.0f;    // phải khớp CAP_WIDTH bên Python
+
+// ---- Cảm biến khoảng cách TOF400C-VL53L1X ----
+const int      SDA_PIN = 21;
+const int      SCL_PIN = 22;
+const uint16_t TOF_MAX_VALID_MM = 4000;     // trên ngưỡng này -> valid=0 (chế độ Long đo tối đa ~4 m). Phải lớn hơn ZOOM_DIST_THRESHOLD_MM bên Python (800)
+const uint32_t TOF_BUDGET_US    = 33000;    // timing budget ~33 ms -> ~30 Hz (VL53L1X Long: tối thiểu 20 ms; tăng lên 50-100 ms nếu muốn ít nhiễu hơn)
+const uint16_t TOF_PERIOD_MS    = 33;       // chu kỳ đo liên tục, phải >= TOF_BUDGET_US/1000
+const unsigned long TOF_POLL_MS = 3;        // chu kỳ hỏi cờ "có mẫu mới" (không chặn)
 
 // ---- Tham số chỉnh được LÚC CHẠY ----
 // Giá trị dưới đây chỉ là MẶC ĐỊNH khi ESP32 khởi động (= bộ đã tune trên phần cứng). GUI Python (TUNING_GUI) ghi đè bằng gói
@@ -97,6 +111,9 @@ struct Axis {
 Servo panServo, tiltServo;
 Axis pan  = {0, 0, 0, PAN_MIN,  PAN_MAX,  PAN_DIR,  0, 0, 0, false, PAN_HOME,  PAN_HOME,  0, 0, 0, false};
 Axis tilt = {0, 0, 0, TILT_MIN, TILT_MAX, TILT_DIR, 0, 0, 0, false, TILT_HOME, TILT_HOME, 0, 0, 0, false};
+
+VL53L1X tof;
+bool    tofOk = false;
 
 char rxBuf[64];
 uint8_t rxLen = 0;
@@ -232,6 +249,18 @@ void parseParam(const char *line) {
 
 void parseLine(const char *line) {
   if (line[0] == 'P' && line[1] == ',') { parseParam(line); return; }
+  if (line[0] == 'H' && line[1] == ',') {          // H,<pan>,<tilt>: về Home
+    float hp, ht;
+    if (sscanf(line, "H,%f,%f", &hp, &ht) == 2) {
+      pan.cmd  = clampf(hp, PAN_MIN,  PAN_MAX);
+      tilt.cmd = clampf(ht, TILT_MIN, TILT_MAX);
+      pan.vel = tilt.vel = 0;
+      pan.vTarget = tilt.vTarget = 0;
+      resetPid(pan); resetPid(tilt);
+      hadTargetBefore = false;
+    }
+    return;
+  }
   if (line[0] != 'E') return;
   float ex, ey;
   int has;
@@ -257,9 +286,44 @@ void readSerial() {
   }
 }
 
+// Đọc VL53L1X KHÔNG CHẶN: chỉ gọi read(false) khi dataReady() báo có mẫu mới
+// (tương đương read(true) nhưng bỏ vòng chờ để không làm đứng vòng servo 200 Hz).
+// Lưu ý: read(false) của Pololu KHÔNG tự kiểm tra dataReady() nên bắt buộc phải gọi dataReady() trước.
+void pollTof() {
+  static unsigned long tPoll = 0, tErr = 0;
+  unsigned long now = millis();
+
+  if (!tofOk) {                                   // báo lỗi mỗi 1 s để GUI hiện "T,ERR"
+    if (now - tErr >= 1000) { tErr = now; Serial.println("T,ERR"); }
+    return;
+  }
+  if (now - tPoll < TOF_POLL_MS) return;
+  tPoll = now;
+
+  if (!tof.dataReady()) return;                    // chưa có mẫu mới
+  tof.read(false);                                 // đọc kết quả + xoá cờ ngắt, không chờ
+  uint16_t mm = tof.ranging_data.range_mm;
+
+  // VL53L1X có mã trạng thái riêng: chỉ tin khi RangeValid (0). SigmaFail/SignalFail/OutOfBoundsFail... -> valid=0
+  bool valid = (tof.ranging_data.range_status == VL53L1X::RangeValid) &&
+               (mm > 0 && mm <= TOF_MAX_VALID_MM);
+  Serial.print("D,"); Serial.print(mm); Serial.print(',');
+  Serial.println(valid ? 1 : 0);
+}
+
 void setup() {
-  Serial.begin(115200);   // không Serial.print debug để khỏi lẫn dữ liệu
+  Serial.begin(115200);   // chỉ in dòng D,... và T,ERR (Python bỏ qua dòng lạ); không in debug khác
   applyParams();
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  tof.setTimeout(500);                // mặc định 0 = không timeout -> init() có thể treo nếu mất dây
+  tofOk = tof.init();
+  if (tofOk) {
+    tof.setDistanceMode(VL53L1X::Long);              // Long ~4 m (Short ~1.3 m, Medium ~3 m)
+    tof.setMeasurementTimingBudget(TOF_BUDGET_US);
+    tof.startContinuous(TOF_PERIOD_MS);              // đối số = chu kỳ đo [ms]
+  }
 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
@@ -274,6 +338,7 @@ void setup() {
 
 void loop() {
   readSerial();
+  pollTof();
   unsigned long nowMs = millis();
 
   // ---- Có gói mới: cập nhật vận tốc mong muốn ----

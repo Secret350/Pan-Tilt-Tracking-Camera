@@ -2,7 +2,7 @@
 gui.py - Giao diện điều khiển Pan-Tilt Tracking (nền sáng, phong cách Claude Code)
 
 File này CHỈ lo giao diện: vẽ video + box, danh sách ID, thanh trượt PID, trạng thái, khoảng cách.
-Toàn bộ phần chạy chương trình (camera, model, tracking, serial ESP32, cảm biến VL53L0X, zoom)
+Toàn bộ phần chạy chương trình (camera, model, tracking, serial ESP32, cảm biến VL53L1X, zoom)
 nằm trong infer_webcam.py (core) -> lớp TrackingEngine.
 
 CÁCH DÙNG
@@ -36,7 +36,7 @@ PANEL_W = 372
 
 core = importlib.import_module(CORE_MODULE)
 
-# ======================= BẢNG MÀU (kiểu Claude Code, sáng) =======================
+# ======================= BẢNG MÀU =======================
 BG = "#FAF9F5"
 CARD = "#FFFFFF"
 BORDER = "#E3DFD3"
@@ -474,7 +474,7 @@ class App(tk.Tk):
             self.sv["sensor"].set("ngoài tầm đo / không hợp lệ")
             self.sl["sensor"].config(fg=AMBER)
         elif ds == "SENSOR_ERR":
-            self.sv["sensor"].set("không tìm thấy VL53L0X (T,ERR)")
+            self.sv["sensor"].set("không tìm thấy VL53L1X (T,ERR)")
             self.sl["sensor"].config(fg=RED)
         elif ds == "NO_SERIAL":
             self.sv["sensor"].set("tắt (không có serial)")

@@ -2,7 +2,7 @@
 infer_webcam.py - CORE của chương trình Pan-Tilt Tracking.
 
 File này làm toàn bộ phần "chạy chương trình": camera, model YOLO + tracker, chọn/khóa mục tiêu,
-gửi lệnh sang ESP32, nhận khoảng cách từ VL53L0X và zoom số theo khoảng cách.
+gửi lệnh sang ESP32, nhận khoảng cách từ TOF400C-VL53L1X và zoom số theo khoảng cách.
 File gui.py chỉ vẽ giao diện và gọi vào TrackingEngine ở đây.
 
 CÁCH CHẠY
@@ -11,7 +11,7 @@ CÁCH CHẠY
 
 GIAO THỨC SERIAL
   PC -> ESP32 : E,<err_x>,<err_y>,<has_target>\n   |  P,<tên>,<giá trị>\n  |  H,<pan>,<tilt>\n
-  ESP32 -> PC : D,<khoảng_cách_mm>,<valid>\n        |  T,ERR\n (không tìm thấy VL53L0X)
+  ESP32 -> PC : D,<khoảng_cách_mm>,<valid>\n        |  T,ERR\n (không tìm thấy VL53L1X)
 
 YÊU CẦU OPENCV
   OpenCV >= 5 (xem CV_MIN_MAJOR). Cài (opencv 5 cần numpy >= 2):
@@ -56,12 +56,12 @@ except ImportError:
 # --- OpenCV ---
 CV_MIN_MAJOR = 5  # thấp hơn vẫn chạy được nhưng sẽ in cảnh báo lúc khởi động
 
-# ---Distance (VL53L0X sensor)---
-DIST_MEDIAN_N = 30  # lọc median 5 mẫu gần nhất (khử nhiễu xung)
+# ---Distance (TOF400C-VL53L1X sensor)---
+DIST_MEDIAN_N = 30  # lọc median 30 mẫu gần nhất (~1 s ở 30 Hz) (khử nhiễu xung)
 DIST_MAX_AGE_S = 0.4  # thời gian đợi trước khi coi như mất dữ liệu từ sensor
 DIST_GATE_ERR_PX = 80  # chỉ tin khoảng cách khi |errx|,|erry| nhỏ hơn mức này
 
-# --- Đo khoảng cách bằng thị giác (OpenCV), hiển thị song song với VL53L0X để so sánh ---
+# --- Đo khoảng cách bằng thị giác (OpenCV), hiển thị song song với VL53L1X để so sánh ---
 #   "pnp" : cv2.solvePnP (SQPNP + LM) trên 14 landmark MediaPipe + mô hình mặt 3D chuẩn -> độ sâu Z của đỉnh mũi.
 #           Cần FACE_MASK_ENABLE (lấy landmark từ MediaPipe), chạy theo nhịp FACE_MASK_EVERY_N.
 #   "bbox": tam giác đồng dạng Z = f * bề_ngang_đầu_thật / bề_ngang_box. Chạy mọi frame, không cần MediaPipe.
@@ -82,7 +82,7 @@ DIST_CMP_WINDOW = 300  # số cặp (sensor, thị giác) gần nhất dùng tí
 DIST_CMP_MAX_SPREAD_MM = 40  # chỉ ghi cặp so sánh khi các mẫu sensor gần nhất dao động <= mức này (median của sensor bị trễ khi người đang di chuyển)
 
 # --- Camera ---
-CAMERA_INDEX=0
+CAMERA_INDEX=1
 # CAMERA_INDEX = 1
 CAP_BACKEND = "MSMF"  # đã probe: MSMF cho ~28.9 fps ở 1280x720 (backend tốt nhất trên thiết bị)
 CAP_FOURCC_FIRST = False  # MSMF bỏ qua FOURCC nên FALSE/TRUE đều cho 28.9 fps;
@@ -141,12 +141,12 @@ SERIAL_PORT = "COM9"  # thay bằng cổng ESP32 trong Device Manager (Ports - C
 SERIAL_BAUD = 115200
 SERIAL_BOOT_WAIT_SEC = 2.0  # ESP32 tự reset khi mở cổng COM, cần chờ khởi động
 
-# --- Zoom số theo khoảng cách VL53L0X (MỚI) ---
+# --- Zoom số theo khoảng cách VL53L1X ---
 ZOOM_ENABLE = True
 ZOOM_FACTOR = 1.5  # hệ số zoom (cắt giữa khung rồi resize lại bằng OpenCV)
-ZOOM_DIST_THRESHOLD_MM = 800  # khoảng cách > ngưỡng này thì zoom. Phải nhỏ hơn TOF_MAX_VALID_MM trong .ino (1200)
+ZOOM_DIST_THRESHOLD_MM = 800  # khoảng cách > ngưỡng này thì zoom. Phải nhỏ hơn TOF_MAX_VALID_MM trong .ino (4000)
 ZOOM_RELEASE_HYST_MM = 100  # đang zoom: chỉ thôi zoom khi đo được khoảng cách < ngưỡng - 100 mm (chống nháy)
-ZOOM_FAR_AS_EXCEED = True  # cảm biến báo "ngoài tầm đo" (xa hơn ~1.2 m) cũng tính là vượt ngưỡng
+ZOOM_FAR_AS_EXCEED = True  # cảm biến báo "ngoài tầm đo" (xa hơn ~4 m hoặc tín hiệu yếu: range_status != RangeValid) cũng tính là vượt ngưỡng
 ZOOM_LOST_GRACE_SEC = 0.3  # box biến mất bao lâu thì trả về x1.0 (0 = trả về ngay lập tức)
 
 # --- Mask khuôn mặt bám theo đường viền (MediaPipe landmark -> convex hull) ---
